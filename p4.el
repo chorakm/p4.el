@@ -84,6 +84,13 @@
                  (if (memq system-type '(ms-dos windows-nt)) '(".exe")))
     "The p4 executable."
     :type 'string
+    :group 'p4)
+
+  (defcustom p4-compile-help-text nil
+    "If non-NIL, run `p4 help' for every command while compiling p4.el.
+This produces more detailed command docstrings, but can make builds
+very slow when the compiler has no valid Perforce connection."
+    :type 'boolean
     :group 'p4))
 
 (defcustom p4-cygpath-exec "cygpath"
@@ -1577,7 +1584,8 @@ changelevel."
   ;; When byte-compiling, get help text by running "p4 help cmd".
   (defun p4-help-text (cmd text)
     (with-temp-buffer
-      (if (and (stringp p4-executable)
+      (if (and p4-compile-help-text
+               (stringp p4-executable)
                (file-executable-p p4-executable)
                (zerop (p4-call-process nil t nil "help" cmd)))
           (concat text "\n" (buffer-substring (point-min) (point-max)))
@@ -1770,15 +1778,74 @@ the context to determine the filename if necessary."
   (p4-call-command "diff2" args
                    :mode 'p4-diff-mode :callback 'p4-activate-diff-buffer))
 
-(defun p4-activate-ediff-callback ()
+(defun p4-ediff-kill-temp-buffers (buffers)
+  "Kill P4-generated BUFFERS belonging to an Ediff session."
+  (setq p4-filespec-buffer-cache
+        (delq nil
+              (mapcar
+               (lambda (entry)
+                 (unless (memq (third entry) buffers)
+                   entry))
+               p4-filespec-buffer-cache)))
+  (dolist (buffer buffers)
+    (when (buffer-live-p buffer)
+      (kill-buffer buffer))))
+
+(defun p4-ediff-finish (buffers window-configuration)
+  "Clean up BUFFERS and restore WINDOW-CONFIGURATION after Ediff."
+  (p4-ediff-kill-temp-buffers buffers)
+  (when (window-configuration-p window-configuration)
+    (set-window-configuration window-configuration)))
+
+(defun p4-ediff-cleanup-setup (buffers window-configuration)
+  "Return an Ediff startup hook that cleans up and restores windows on exit."
+  (lexical-let ((buffers buffers)
+                (window-configuration window-configuration))
+    (lambda ()
+      (lexical-let ((buffers buffers)
+                    (window-configuration window-configuration))
+        (add-hook 'ediff-after-quit-hook-internal
+                  (lambda ()
+                    (p4-ediff-finish buffers window-configuration))
+                  nil t)))))
+
+(defun p4-ediff-buffers (buffer-a buffer-b temp-buffers
+                                  &optional window-configuration)
+  "Ediff BUFFER-A and BUFFER-B, killing TEMP-BUFFERS on exit.
+Restore WINDOW-CONFIGURATION afterward, or the current window
+configuration if it is omitted."
+  (ediff-buffers buffer-a buffer-b
+                 (list
+                  (p4-ediff-cleanup-setup
+                   temp-buffers
+                   (or window-configuration
+                       (current-window-configuration))))))
+
+(defun p4-activate-ediff-callback
+    (&optional depot-first current-temp window-configuration)
   "Return a callback function that runs ediff on the current
-buffer and the P4 output buffer."
-  (lexical-let ((orig-buffer (current-buffer)))
+buffer and the P4 output buffer.  If DEPOT-FIRST is non-NIL, use
+the P4 output as buffer A and the current buffer as buffer B.  If
+CURRENT-TEMP is non-NIL, also remove the current buffer on exit.
+Restore WINDOW-CONFIGURATION after Ediff."
+  (lexical-let ((orig-buffer (current-buffer))
+                (depot-first depot-first)
+                (current-temp current-temp)
+                (window-configuration
+                 (or window-configuration (current-window-configuration))))
     (lambda ()
       (when (buffer-live-p orig-buffer)
         (p4-fontify-print-buffer t)
         (lexical-let ((depot-buffer (current-buffer)))
-          (ediff-buffers orig-buffer depot-buffer))))))
+          (if depot-first
+              (p4-ediff-buffers depot-buffer orig-buffer
+                                (list depot-buffer)
+                                window-configuration)
+            (p4-ediff-buffers orig-buffer depot-buffer
+                              (if current-temp
+                                  (list orig-buffer depot-buffer)
+                                (list depot-buffer))
+                              window-configuration)))))))
 
 (defun p4-ediff (prefix)
   "Use ediff to compare file with its original client version."
@@ -1786,16 +1853,19 @@ buffer and the P4 output buffer."
   (if prefix
       (call-interactively 'p4-ediff2)
     (p4-call-command "print" (list (concat (p4-context-single-filename) "#have"))
-                     :after-show (p4-activate-ediff-callback))))
+                     :after-show (p4-activate-ediff-callback t))))
 
 (defun p4-activate-ediff2-callback (other-file)
   "Return a callback function that runs ediff on the P4 output
 buffer and OTHER-FILE."
-  (lexical-let ((other-file other-file))
+  (lexical-let ((other-file other-file)
+                (window-configuration (current-window-configuration)))
     (lambda ()
       (p4-fontify-print-buffer t)
       (p4-call-command "print" (list other-file)
-                       :after-show (p4-activate-ediff-callback)))))
+                       :after-show
+                       (p4-activate-ediff-callback
+                        nil t window-configuration)))))
 
 (defun p4-ediff2 (rev1 rev2)
   "Use ediff to compare two versions of a depot file.
@@ -1808,6 +1878,129 @@ When visiting a depot file, type \\[p4-ediff2] and enter the versions."
                                (when (> rev 1) (number-to-string rev))))))
   (p4-call-command "print" (list (p4-get-file-rev rev1))
    :after-show (p4-activate-ediff2-callback (p4-get-file-rev rev2))))
+
+(defun p4-describe-file-at-point ()
+  "Return information about the file at point in a describe buffer.
+The result is a property list containing the changelist number,
+status, section, depot file, revision, action, and client."
+  (let ((line-start (line-beginning-position))
+        change client pending section depot-file revision action)
+    (save-excursion
+      (beginning-of-line)
+      (unless (looking-at
+               "^\\.\\.\\. \\(//[^#\n]+\\)#\\([1-9][0-9]*\\) \\([^ \t\n]+\\)")
+        (error "Point is not on a file in a P4 describe buffer"))
+      (setq depot-file (match-string-no-properties 1)
+            revision (string-to-number (match-string 2))
+            action (match-string-no-properties 3))
+      (goto-char (point-min))
+      (unless (re-search-forward
+               "^Change \\([1-9][0-9]*\\) by [^@\n]+@\\([^ \n]+\\)\\(.*\\)$"
+               line-start t)
+        (error "Can't find the changelist header"))
+      (setq change (string-to-number (match-string 1))
+            client (match-string-no-properties 2)
+            pending (and (string-match "\\*pending\\*" (match-string 3)) t))
+      (goto-char line-start)
+      (when (re-search-backward "^\\(Affected\\|Shelved\\) files \\.\\.\\.$"
+                                nil t)
+        (setq section (downcase (match-string-no-properties 1)))))
+    (list 'change change
+          'client client
+          'pending pending
+          'section section
+          'depot-file depot-file
+          'revision revision
+          'action action)))
+
+(defun p4-describe-add-action-p (action)
+  "Return non-NIL if ACTION creates a file without a base revision."
+  (or (member action '("add" "branch" "import"))
+      (string-match "/add\\'" action)))
+
+(defun p4-describe-delete-action-p (action)
+  "Return non-NIL if ACTION removes a file."
+  (or (string-equal action "delete")
+      (string-match "/delete\\'" action)))
+
+(defun p4-describe-workspace-buffer (info)
+  "Return the workspace buffer for the pending file described by INFO."
+  (let* ((change-client (plist-get info 'client))
+         (current-client (p4-current-client))
+         (depot-file (plist-get info 'depot-file)))
+    (unless (and current-client (string-equal current-client change-client))
+      (error "Pending change %d belongs to client %s, not current client %s"
+             (plist-get info 'change) change-client
+             (or current-client "<none>")))
+    (let ((path
+           (p4-with-temp-buffer (list "-ztag" "where" depot-file)
+             (when (re-search-forward "^\\.\\.\\. path \\(.*\\)$" nil t)
+               (replace-regexp-in-string
+                "\r\\'" "" (match-string-no-properties 1))))))
+      (unless path
+        (error "Can't map %s in client %s" depot-file current-client))
+      (unless (file-readable-p path)
+        (error "Workspace file is not readable: %s" path))
+      (find-file-noselect path))))
+
+(defun p4-describe-empty-buffer (info label)
+  "Return an empty buffer for the file described by INFO.
+LABEL distinguishes the side of the comparison."
+  (let ((buffer
+         (get-buffer-create
+          (format "*P4 %s %s@%d*"
+                  label
+                  (plist-get info 'depot-file)
+                  (plist-get info 'change)))))
+    (with-current-buffer buffer
+      (let ((inhibit-read-only t))
+        (erase-buffer)
+        (fundamental-mode)
+        (setq buffer-read-only t)
+        (set-buffer-modified-p nil)))
+    buffer))
+
+(defun p4-describe-ediff-file ()
+  "Ediff the base and changed versions of the describe file at point.
+For a shelved file, compare its base revision with @=CHANGE.  For
+a submitted file, compare the preceding and submitted revisions.
+For an unshelved pending file, compare its base revision with the
+workspace file, which requires the changelist's client to be the
+current client.  Added and deleted files are compared with an
+empty buffer."
+  (interactive)
+  (let* ((info (p4-describe-file-at-point))
+         (change (plist-get info 'change))
+         (depot-file (plist-get info 'depot-file))
+         (revision (plist-get info 'revision))
+         (action (plist-get info 'action))
+         (shelved (string-equal (plist-get info 'section) "shelved"))
+         (pending (plist-get info 'pending))
+         (add (p4-describe-add-action-p action))
+         (delete (p4-describe-delete-action-p action))
+         (base-revision (if (or shelved pending) revision (1- revision)))
+         (base-filespec
+          (unless (or add (< base-revision 1))
+            (format "%s#%d" depot-file base-revision)))
+         (changed-filespec
+          (cond (delete nil)
+                (shelved (format "%s@=%d" depot-file change))
+                (pending nil)
+                (t (format "%s#%d" depot-file revision))))
+         (base-buffer
+          (if base-filespec
+              (p4-visit-filespec base-filespec)
+            (p4-describe-empty-buffer info "empty base")))
+         (changed-buffer
+          (cond (changed-filespec (p4-visit-filespec changed-filespec))
+                (delete (p4-describe-empty-buffer info "empty result"))
+                (pending (p4-describe-workspace-buffer info))
+                (t (error "Can't determine the changed file version")))))
+    (p4-ediff-buffers
+     base-buffer changed-buffer
+     (delq nil
+           (list base-buffer
+                 (when (or changed-filespec delete) changed-buffer))))))
 
 (defun p4-edit-pop-up-output-p ()
   "Show the output of p4 edit in the echo area if it concerns a
@@ -2443,6 +2636,32 @@ argument DELETE-FILESPEC is non-NIL, remove the first line."
                                     (goto-char start)
                                     (line-end-position))))))))
 
+(defun p4-pending-describe-add-files ()
+  "Return pending add filespec mappings for the current describe buffer.
+Each element has the form (FILESPEC . PENDING-FILESPEC), where
+FILESPEC is the displayed depot revision and PENDING-FILESPEC uses
+@=CHANGE so the file can be printed before submission."
+  (save-excursion
+    (goto-char (point-min))
+    (when (looking-at "^Change \\([1-9][0-9]*\\).*\\*pending\\*")
+      (let ((change (string-to-number (match-string-no-properties 1)))
+            files)
+        (while (re-search-forward
+                "^\\.\\.\\. \\(\\(//[^#\n]+\\)#\\([1-9][0-9]*\\)\\) \\([a-z]+\\)\\(?: \\|$\\)"
+                nil t)
+          (when (and (string= (match-string-no-properties 3) "1")
+                     (string= (match-string-no-properties 4) "add"))
+            (let ((pending-filespec
+                   (format "%s@=%d"
+                           (match-string-no-properties 2)
+                           change)))
+              (push (cons (match-string-no-properties 1)
+                          pending-filespec)
+                    files)
+              (add-text-properties (match-beginning 1) (match-end 1)
+                                   `(link-depot-name ,pending-filespec)))))
+        files))))
+
 (defun p4-activate-print-buffer (&optional delete-filespec)
   (p4-fontify-print-buffer delete-filespec)
   (p4-mark-print-buffer t)
@@ -2458,42 +2677,54 @@ argument DELETE-FILESPEC is non-NIL, remove the first line."
 
 (defun p4-activate-diff-buffer ()
   (save-excursion
-    (p4-mark-depot-list-buffer)
-    (p4-find-jobs (point-min) (point-max))
-    (goto-char (point-min))
-    (while (re-search-forward "^\\(==== //\\).*\n"
-                              nil t)
-      (let* ((link-depot-name (get-char-property (match-end 1) 'link-depot-name))
-             (start (match-beginning 0))
-             (end (save-excursion
-                    (if (re-search-forward "^==== " nil t)
-                        (match-beginning 0)
-                      (point-max)))))
-        (when link-depot-name
-          (add-text-properties start end `(block-depot-name ,link-depot-name)))))
+    (let ((pending-add-files
+           (progn
+             (p4-mark-depot-list-buffer)
+             (p4-pending-describe-add-files))))
+      (p4-find-jobs (point-min) (point-max))
 
-    (goto-char (point-min))
-    (while (re-search-forward
-            (concat "^[@0-9].*\\([cad+]\\)\\([0-9]*\\).*\n"
-                    "\\(\\(\n\\|[^@0-9\n].*\n\\)*\\)") nil t)
-      (let ((first-line (string-to-number (match-string 2)))
-            (start (match-beginning 3))
-            (end (match-end 3)))
-        (add-text-properties start end `(first-line ,first-line start ,start))))
+      (goto-char (point-min))
+      (while (re-search-forward "^==== \\(//[^#\n]+#[1-9][0-9]*\\).*\n"
+                                nil t)
+        (let* ((filespec (match-string-no-properties 1))
+               (filespec-start (match-beginning 1))
+               (filespec-end (match-end 1))
+               (link-depot-name
+                (or (cdr (assoc filespec pending-add-files))
+                    (get-char-property filespec-start 'link-depot-name)))
+               (start (match-beginning 0))
+               (end (save-excursion
+                      (if (re-search-forward "^==== " nil t)
+                          (match-beginning 0)
+                        (point-max)))))
+          (when link-depot-name
+            (add-text-properties filespec-start filespec-end
+                                 `(link-depot-name ,link-depot-name))
+            (add-text-properties start end
+                                 `(block-depot-name ,link-depot-name)))))
 
-    (goto-char (point-min))
-    (let ((stop
-           (if (re-search-forward "^\\(\\.\\.\\.\\|====\\)" nil t)
-               (match-beginning 0)
-             (point-max))))
-      (p4-find-change-numbers (point-min) stop))
+      (goto-char (point-min))
+      (while (re-search-forward
+              (concat "^[@0-9].*\\([cad+]\\)\\([0-9]*\\).*\n"
+                      "\\(\\(\n\\|[^@0-9\n].*\n\\)*\\)") nil t)
+        (let ((first-line (string-to-number (match-string 2)))
+              (start (match-beginning 3))
+              (end (match-end 3)))
+          (add-text-properties start end `(first-line ,first-line start ,start))))
 
-    (goto-char (point-min))
-    (when (looking-at "^Change [1-9][0-9]* by \\([^ @\n]+\\)@\\([^ \n]+\\)")
-      (p4-create-active-link-group 1 `(user ,(match-string-no-properties 1))
-                                   "Describe user")
-      (p4-create-active-link-group 2 `(client ,(match-string-no-properties 2))
-                                   "Describe client"))))
+      (goto-char (point-min))
+      (let ((stop
+             (if (re-search-forward "^\\(\\.\\.\\.\\|====\\)" nil t)
+                 (match-beginning 0)
+               (point-max))))
+        (p4-find-change-numbers (point-min) stop))
+
+      (goto-char (point-min))
+      (when (looking-at "^Change [1-9][0-9]* by \\([^ @\n]+\\)@\\([^ \n]+\\)")
+        (p4-create-active-link-group 1 `(user ,(match-string-no-properties 1))
+                                     "Describe user")
+        (p4-create-active-link-group 2 `(client ,(match-string-no-properties 2))
+                                     "Describe client")))))
 
 (defun p4-activate-fixes-buffer ()
   (let ((inhibit-read-only t))
@@ -3553,6 +3784,7 @@ is NIL, otherwise return NIL."
     (define-key map [backtab] 'diff-hunk-prev)
     (define-key map "}" 'diff-file-next)
     (define-key map "{" 'diff-file-prev)
+    (define-key map "e" 'p4-describe-ediff-file)
     (define-key map "\C-m" 'p4-buffer-commands)
     (define-key map [mouse-2] 'p4-buffer-commands)
     (define-key map "o" 'p4-buffer-commands)
@@ -3591,9 +3823,16 @@ REVERSE is non-NIL."
           ((looking-at "^==== \\(//[^@#\n]+\\)#\\([1-9][0-9]*\\).* ====")
            ;; The output of p4 describe contains just the new
            ;; revision number: the old revision number is one less.
-           (let ((revision (string-to-number (match-string 2))))
-             (format "%s#%d" (match-string-no-properties 1)
-                     (max 1 (if reverse (1- revision) revision)))))
+           (let* ((file (match-string-no-properties 1))
+                  (revision (string-to-number (match-string 2)))
+                  (filespec (format "%s#%d" file revision))
+                  (rewritten-filespec
+                   (get-char-property (match-beginning 1) 'link-depot-name)))
+             (if (and rewritten-filespec
+                      (not (string-equal rewritten-filespec filespec)))
+                 rewritten-filespec
+               (format "%s#%d" file
+                       (max 1 (if reverse (1- revision) revision))))))
           ((looking-at "^--- \\(//[^\t\n]+\\)\t\\([1-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9] [0-9][0-9]:[0-9][0-9]:[0-9][0-9]\\)[.0-9]* \\([+-]?\\)\\([0-9][0-9][0-9][0-9]\\).*\n\\+\\+\\+ \\([^\t\n]+\\)\t")
            (if reverse
                (let ((time (date-to-time (format "%s %s%s" (match-string 2)
