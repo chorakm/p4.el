@@ -3507,17 +3507,22 @@ is NIL, otherwise return NIL."
 
 (defun p4-basic-list-activate ()
   (interactive)
-  (if (get-char-property (point) 'active)
-      (p4-buffer-commands (point))
-    (save-excursion
-      (beginning-of-line)
-      (when (looking-at p4-basic-list-filename-regexp)
-        (if (match-string 3)
-            (let ((args (list "where" (match-string 2))))
-              (p4-with-temp-buffer args
-                (when (looking-at "//[^ \n]+ //[^ \n]+ \\(.*\\)")
-                  (find-file (match-string 1)))))
-          (p4-depot-find-file (match-string 1)))))))
+  (let ((change (and (eq major-mode 'p4-opened-list-mode)
+                     (get-char-property (point) 'pending))))
+    (cond (change
+           (p4-opened (list "-c" change)))
+          ((get-char-property (point) 'active)
+           (p4-buffer-commands (point)))
+          (t
+           (save-excursion
+             (beginning-of-line)
+             (when (looking-at p4-basic-list-filename-regexp)
+               (if (match-string 3)
+                   (let ((args (list "where" (match-string 2))))
+                     (p4-with-temp-buffer args
+                       (when (looking-at "//[^ \n]+ //[^ \n]+ \\(.*\\)")
+                         (find-file (match-string 1)))))
+                 (p4-depot-find-file (match-string 1)))))))))
 
 
 ;;; Opened list mode:
