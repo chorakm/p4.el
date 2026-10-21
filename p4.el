@@ -2243,7 +2243,10 @@ followed by \"delete\"."
   (p4-call-command cmd args :mode 'p4-opened-list-mode
    :callback (lambda ()
                (p4-regexp-create-links "\\<change \\([1-9][0-9]*\\) ([a-z]+)"
-                                       'pending "Edit change"))
+                                       'pending "Edit change")
+               (p4-regexp-create-links "\\<\\(default\\) change ([a-z]+)"
+                                       'opened-change
+                                       "List files in change"))
    :pop-up-output (lambda () t)))
 
 (defp4cmd* print
@@ -3365,6 +3368,7 @@ is NIL, otherwise return NIL."
         (help (get-char-property pnt 'help))
         (job (get-char-property pnt 'job))
         (label (get-char-property pnt 'label))
+        (opened-change (get-char-property pnt 'opened-change))
         (pending (get-char-property pnt 'pending))
         (user (get-char-property pnt 'user))
         (rev (get-char-property pnt 'rev)))
@@ -3380,6 +3384,7 @@ is NIL, otherwise return NIL."
           (change (apply #'p4-describe
                    (append (p4-make-list-from-string p4-default-diff-options)
                            (list (format "%d" change)))))
+          (opened-change (p4-opened (list "-c" opened-change)))
           (pending (p4-change pending))
           (user (p4-user user))
           (group (p4-group group))
@@ -3508,7 +3513,8 @@ is NIL, otherwise return NIL."
 (defun p4-basic-list-activate ()
   (interactive)
   (let ((change (and (eq major-mode 'p4-opened-list-mode)
-                     (get-char-property (point) 'pending))))
+                     (or (get-char-property (point) 'opened-change)
+                         (get-char-property (point) 'pending)))))
     (cond (change
            (p4-opened (list "-c" change)))
           ((get-char-property (point) 'active)
